@@ -1,0 +1,10 @@
+Debug/
+Release/
+.settings/
+.vscode/
+RTOS_DTC_Comento Debug.launch
+*.elf
+*.map
+*.list
+*.o
+*.d
