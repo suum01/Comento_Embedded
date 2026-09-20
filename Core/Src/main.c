@@ -84,6 +84,13 @@ typedef union
 
 } DTC_Status_t;
 
+typedef struct
+{
+    uint8_t dtc[3];
+    DTC_Status_t status;
+
+} DTC_Record_t;
+
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
@@ -92,12 +99,53 @@ typedef union
 
 /* Private macro -------------------------------------------------------------*/
 /* USER CODE BEGIN PM */
-#define SLAVE_ADDR 0x69
+/* =========================================================
+ * PMIC
+ * ========================================================= */
 
-#define PMIC_BUCK4_VREF_REG     0x0F
-#define PMIC_BUCK4_1V2_CODE     0x40
+/* MP5424 I2C 7-bit Slave Address */
+#define SLAVE_ADDR                 0x69
+
+/* Buck4 Voltage Control */
+#define PMIC_BUCK4_VREF_REG        0x0F
+#define PMIC_BUCK4_1V2_CODE        0x40
+
+
+/* =========================================================
+ * 25LC256 EEPROM
+ * ========================================================= */
+
+/* EEPROM Instruction */
+#define EEPROM_CMD_READ            0x03
+#define EEPROM_CMD_WRITE           0x02
+#define EEPROM_CMD_WRDI            0x04
+#define EEPROM_CMD_WREN            0x06
+#define EEPROM_CMD_RDSR            0x05
+
+/* DTC 저장 시작 주소 */
+#define EEPROM_DTC_ADDR            0x0000
+
+
+/* EEPROM Chip Select Control
+ * EEPROM_CS_Pin / EEPROM_CS_GPIO_Port는
+ * CubeMX가 main.h에 생성한 값 사용
+ */
+#define EEPROM_CS_LOW()  HAL_GPIO_WritePin(EEPROM_CS_GPIO_Port, EEPROM_CS_Pin, GPIO_PIN_RESET)
+#define EEPROM_CS_HIGH() HAL_GPIO_WritePin(EEPROM_CS_GPIO_Port, EEPROM_CS_Pin, GPIO_PIN_SET)
+
+
+#define TESTCASE_NORMAL        0
+#define TESTCASE_PMIC_FAULT    1
+#define TESTCASE_DTC_READ      2
+#define TESTCASE_DTC_CLEAR     3
+
+#define TESTCASE               TESTCASE_DTC_CLEAR
+
 
 /* USER CODE END PM */
+
+
+
 
 /* Private variables ---------------------------------------------------------*/
 ADC_HandleTypeDef hadc1;
@@ -106,8 +154,8 @@ CAN_HandleTypeDef hcan1;
 
 I2C_HandleTypeDef hi2c1;
 I2C_HandleTypeDef hi2c2;
-DMA_HandleTypeDef hdma_i2c1_rx;
 DMA_HandleTypeDef hdma_i2c1_tx;
+DMA_HandleTypeDef hdma_i2c1_rx;
 DMA_HandleTypeDef hdma_i2c2_rx;
 DMA_HandleTypeDef hdma_i2c2_tx;
 
@@ -165,57 +213,148 @@ osMutexId_t CommMutexHandleHandle;
 const osMutexAttr_t CommMutexHandle_attributes = {
   .name = "CommMutexHandle"
 };
+
+
 /* USER CODE BEGIN PV */
-//TEST num5
-volatile uint8_t pmic_voltage_change_request = 1;
-volatile uint8_t pmic_voltage_write_busy = 0;
+/* =========================================================
+ * PMIC
+ * ========================================================= */
 
-uint8_t buck4_vref_data = PMIC_BUCK4_1V2_CODE;
+/* MP5424 I2C 7-bit Slave Address */
+#define SLAVE_ADDR                 0x69
+
+/* PMIC Status Register */
+#define PMIC_STATUS1               0x27
+#define PMIC_STATUS2               0x28
+
+/* Buck4 Voltage Control */
+#define PMIC_BUCK4_VREF_REG        0x0F
+#define PMIC_BUCK4_1V2_CODE        0x40
 
 
-//PMIC
 PMIC_Status1_t status1;
 PMIC_Status2_t status2;
 
+/* I2C Status Read 진행 단계 */
 volatile uint8_t i2c_step = 0;
 
-//DTC
-typedef struct
-{
-    uint8_t dtc[3];
-    DTC_Status_t  status;
-} DTC_Record_t;
+
+/* PMIC Voltage Change */
+uint8_t buck4_vref_data = PMIC_BUCK4_1V2_CODE;
+
+volatile uint8_t pmic_voltage_change_request = 1;
+volatile uint8_t pmic_voltage_write_busy = 0;
+
+
+
+/* =========================================================
+ * DTC
+ * ========================================================= */
 
 DTC_Record_t brake_dtc;
 
+/* PMIC Fault 발생 후 EEPROM 저장 요청 */
 volatile uint8_t dtc_save_request = 0;
 
+/* EEPROM Read-back 완료 여부 */
+volatile uint8_t dtc_read_ready = 0;
 
-//spi
-uint8_t spiTxData[4];
-uint8_t eeprom_mock[4];
-uint8_t eeprom_read_data[4];
 
+
+/* =========================================================
+ * 25LC256 EEPROM
+ * ========================================================= */
+
+/* 25LC256 Instruction */
+#define EEPROM_CMD_READ            0x03
+#define EEPROM_CMD_WRITE           0x02
+#define EEPROM_CMD_WRDI            0x04
+#define EEPROM_CMD_WREN            0x06
+#define EEPROM_CMD_RDSR            0x05
+
+/* WREN Command */
+uint8_t eeprom_wren_cmd = EEPROM_CMD_WREN;
+
+
+/*
+ * WRITE Packet
+ *
+ * [0] WRITE Command
+ * [1] Address High
+ * [2] Address Low
+ * [3] DTC Byte 1
+ * [4] DTC Byte 2
+ * [5] DTC Byte 3
+ * [6] DTC Status
+ */
+uint8_t eeprom_write_data[7];
+
+
+/*
+ * RDSR
+ *
+ * TX
+ * [0] RDSR Command
+ * [1] Dummy
+ *
+ * RX
+ * [1] Status Register
+ */
+uint8_t eeprom_status_tx[2] =
+{
+    EEPROM_CMD_RDSR,
+    0x00
+};
+
+uint8_t eeprom_status_rx[2] = {0};
+
+
+/*
+ * READ-back
+ *
+ * TX
+ * [0] READ Command
+ * [1] Address High
+ * [2] Address Low
+ * [3~6] Dummy
+ *
+ * RX
+ * [3~6] EEPROM Data
+ */
+uint8_t eeprom_read_tx[7] = {0};
+uint8_t eeprom_read_rx[7] = {0};
+
+
+/* READ-back한 실제 DTC 4Byte */
+uint8_t eeprom_read_data[4] = {0};
+
+
+/* EEPROM State Machine */
+volatile uint8_t eeprom_step = 0;
+
+/* SPI DMA 사용 중 여부 */
 volatile uint8_t spi_busy = 0;
 
-
-volatile uint8_t dtc_read_ready = 0;
+/* EEPROM Write / Read-back 검증 오류 */
 volatile uint8_t eeprom_error = 0;
 
-//CAN RX
+
+
+/* =========================================================
+ * CAN
+ * ========================================================= */
+
 CAN_RxHeaderTypeDef RxHeader;
 uint8_t RxData[8];
 
 volatile uint8_t can_rx_flag = 0;
 
-//CAN TX
+
 CAN_TxHeaderTypeDef TxHeader;
 uint8_t TxData[8];
+
 uint32_t TxMailbox;
 
-//UART
-uint8_t eeprom_mock[4];
-uint8_t eeprom_read_data[4];
 
 /* USER CODE END PV */
 
@@ -254,6 +393,7 @@ void WorkUART(void);
   */
 int main(void)
 {
+
   /* USER CODE BEGIN 1 */
 
   /* USER CODE END 1 */
@@ -289,7 +429,7 @@ int main(void)
   /* USER CODE END 2 */
 
   /* Init scheduler */
-//  osKernelInitialize();
+  osKernelInitialize();
   /* Create the mutex(es) */
   /* creation of CommMutexHandle */
   CommMutexHandleHandle = osMutexNew(&CommMutexHandle_attributes);
@@ -339,11 +479,34 @@ int main(void)
   /* USER CODE END RTOS_EVENTS */
 
   /* Start scheduler */
-//  osKernelStart();
+  osKernelStart();
 
   /* We should never get here as control is now taken by the scheduler */
+
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
+	#if TESTCASE == TESTCASE_PMIC_FAULT
+
+	brake_dtc.dtc[0] = 0x12;
+	brake_dtc.dtc[1] = 0x34;
+	brake_dtc.dtc[2] = 0x56;
+	brake_dtc.status.value = 0x26;
+
+	dtc_save_request = 1;
+
+	#endif
+
+	#if TESTCASE == TESTCASE_DTC_READ
+	RxData[0] = 0x19;
+	RxData[1] = 0x0B;
+	can_rx_flag = 1;
+	#endif
+
+	#if TESTCASE == TESTCASE_DTC_CLEAR
+	RxData[0] = 0x14;
+	can_rx_flag = 1;
+	#endif
+
   while (1)
   {
     /* USER CODE END WHILE */
@@ -370,6 +533,7 @@ void SystemClock_Config(void)
   */
   __HAL_RCC_PWR_CLK_ENABLE();
   __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE1);
+
   /** Initializes the RCC Oscillators according to the specified parameters
   * in the RCC_OscInitTypeDef structure.
   */
@@ -381,6 +545,7 @@ void SystemClock_Config(void)
   {
     Error_Handler();
   }
+
   /** Initializes the CPU, AHB and APB buses clocks
   */
   RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
@@ -413,6 +578,7 @@ static void MX_ADC1_Init(void)
   /* USER CODE BEGIN ADC1_Init 1 */
 
   /* USER CODE END ADC1_Init 1 */
+
   /** Configure the global features of the ADC (Clock, Resolution, Data Alignment and number of conversion)
   */
   hadc1.Instance = ADC1;
@@ -431,6 +597,7 @@ static void MX_ADC1_Init(void)
   {
     Error_Handler();
   }
+
   /** Configure for the selected ADC regular channel its corresponding rank in the sequencer and its sample time.
   */
   sConfig.Channel = ADC_CHANNEL_2;
@@ -689,7 +856,7 @@ static void MX_DMA_Init(void)
   HAL_NVIC_SetPriority(DMA1_Stream4_IRQn, 5, 0);
   HAL_NVIC_EnableIRQ(DMA1_Stream4_IRQn);
   /* DMA1_Stream6_IRQn interrupt configuration */
-  HAL_NVIC_SetPriority(DMA1_Stream6_IRQn, 0, 0);
+  HAL_NVIC_SetPriority(DMA1_Stream6_IRQn, 5, 0);
   HAL_NVIC_EnableIRQ(DMA1_Stream6_IRQn);
   /* DMA1_Stream7_IRQn interrupt configuration */
   HAL_NVIC_SetPriority(DMA1_Stream7_IRQn, 5, 0);
@@ -698,7 +865,7 @@ static void MX_DMA_Init(void)
   HAL_NVIC_SetPriority(DMA2_Stream0_IRQn, 5, 0);
   HAL_NVIC_EnableIRQ(DMA2_Stream0_IRQn);
   /* DMA2_Stream3_IRQn interrupt configuration */
-  HAL_NVIC_SetPriority(DMA2_Stream3_IRQn, 0, 0);
+  HAL_NVIC_SetPriority(DMA2_Stream3_IRQn, 5, 0);
   HAL_NVIC_EnableIRQ(DMA2_Stream3_IRQn);
 
 }
@@ -711,6 +878,9 @@ static void MX_DMA_Init(void)
 static void MX_GPIO_Init(void)
 {
   GPIO_InitTypeDef GPIO_InitStruct = {0};
+  /* USER CODE BEGIN MX_GPIO_Init_1 */
+
+  /* USER CODE END MX_GPIO_Init_1 */
 
   /* GPIO Ports Clock Enable */
   __HAL_RCC_GPIOF_CLK_ENABLE();
@@ -721,6 +891,12 @@ static void MX_GPIO_Init(void)
 
   /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(GPIOB, GPIO_PIN_0|GPIO_PIN_1|GPIO_PIN_2, GPIO_PIN_SET);
+
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(GPIOC, GPIO_PIN_9, GPIO_PIN_RESET);
+
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(EEPROM_CS_GPIO_Port, EEPROM_CS_Pin, GPIO_PIN_SET);
 
   /*Configure GPIO pins : PB0 PB1 */
   GPIO_InitStruct.Pin = GPIO_PIN_0|GPIO_PIN_1;
@@ -736,6 +912,23 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_MEDIUM;
   HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
 
+  /*Configure GPIO pin : PC9 */
+  GPIO_InitStruct.Pin = GPIO_PIN_9;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
+
+  /*Configure GPIO pin : EEPROM_CS_Pin */
+  GPIO_InitStruct.Pin = EEPROM_CS_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(EEPROM_CS_GPIO_Port, &GPIO_InitStruct);
+
+  /* USER CODE BEGIN MX_GPIO_Init_2 */
+
+  /* USER CODE END MX_GPIO_Init_2 */
 }
 
 /* USER CODE BEGIN 4 */
@@ -825,51 +1018,269 @@ void WorkI2C(void)
 
 void HAL_SPI_TxCpltCallback(SPI_HandleTypeDef *hspi)
 {
-	 if (hspi->Instance == SPI1)
-	{
-		 /* EEPROM 저장 Mock */
-		eeprom_mock[0] = spiTxData[0];
-		eeprom_mock[1] = spiTxData[1];
-		eeprom_mock[2] = spiTxData[2];
-		eeprom_mock[3] = spiTxData[3];
+	if (hspi->Instance != SPI1) return;
 
-		/* EEPROM Read-back Mock */
-		eeprom_read_data[0] = eeprom_mock[0];
-		eeprom_read_data[1] = eeprom_mock[1];
-		eeprom_read_data[2] = eeprom_mock[2];
-		eeprom_read_data[3] = eeprom_mock[3];
+	    EEPROM_CS_HIGH();
+	    spi_busy = 0;
 
-		  /* 저장값 검증 */
-		if ((eeprom_read_data[0] == spiTxData[0]) && (eeprom_read_data[1] == spiTxData[1])
-				&& (eeprom_read_data[2] == spiTxData[2]) && (eeprom_read_data[3] == spiTxData[3]))
-		{
-			dtc_read_ready = 1;
-			eeprom_error = 0;
-		}
 
-		 else
-		{
-			dtc_read_ready = 0;
-			eeprom_error = 1;
-		}
+	    /* WREN 완료 */
+	    if (eeprom_step == 1)
+	    {
+	    	EEPROM_CS_HIGH();
 
-		spi_busy = 0;
-		dtc_save_request = 0;
-	}
+			spi_busy = 0;
+
+
+			/* WRITE Packet 생성 */
+
+			eeprom_write_data[0] = EEPROM_CMD_WRITE;
+
+			eeprom_write_data[1] =
+				(uint8_t)((EEPROM_DTC_ADDR >> 8) & 0xFF);
+
+			eeprom_write_data[2] =
+				(uint8_t)(EEPROM_DTC_ADDR & 0xFF);
+
+
+			/* DTC 3Byte */
+			eeprom_write_data[3] = brake_dtc.dtc[0];
+			eeprom_write_data[4] = brake_dtc.dtc[1];
+			eeprom_write_data[5] = brake_dtc.dtc[2];
+
+			/* Status 1Byte */
+			eeprom_write_data[6] =
+				brake_dtc.status.value;
+
+	        EEPROM_CS_LOW();
+
+	        if (HAL_SPI_Transmit_DMA(&hspi1, eeprom_write_data, 7) == HAL_OK)
+	        {
+	            spi_busy = 1;
+	            eeprom_step = 2;
+	        }
+	        else
+	        {
+	            EEPROM_CS_HIGH();
+	            eeprom_error = 1;
+	            eeprom_step = 0;
+	        }
+	    }
+
+	    /* WRITE 완료 */
+	    else if (eeprom_step == 2)
+	    {
+	    	EEPROM_CS_HIGH();
+			spi_busy = 0;
+	        eeprom_step = 3;
+	    }
+}
+
+
+void HAL_SPI_TxRxCpltCallback(SPI_HandleTypeDef *hspi)
+{
+    if (hspi->Instance != SPI1)
+        return;
+
+
+    /*
+     * Step 4
+     * RDSR 완료
+     */
+    if (eeprom_step == 4)
+    {
+        EEPROM_CS_HIGH();
+
+        spi_busy = 0;
+
+
+        /*
+         * RDSR 명령 다음 Byte가 실제 Status Register 값
+         */
+        uint8_t status =
+            eeprom_status_rx[1];
+
+
+        /*
+         * bit0 = WIP
+         *
+         * 1 : Write 진행 중
+         * 0 : Write 완료
+         */
+        if ((status & 0x01) != 0)
+        {
+            /*
+             * 아직 Write 중
+             * 다시 RDSR 수행
+             */
+            eeprom_step = 3;
+        }
+        else
+        {
+            /*
+             * Write 완료
+             * READ-back 단계로 이동
+             */
+            eeprom_step = 5;
+        }
+    }
+
+
+    /*
+     * Step 6
+     * EEPROM READ-back 완료
+     */
+    else if (eeprom_step == 6)
+    {
+        EEPROM_CS_HIGH();
+
+        spi_busy = 0;
+
+
+        /*
+         * RX[0] : READ command 동안 수신한 Dummy
+         * RX[1] : Address High 동안 Dummy
+         * RX[2] : Address Low 동안 Dummy
+         *
+         * 실제 EEPROM Data는 RX[3]부터 시작
+         */
+
+        eeprom_read_data[0] =
+            eeprom_read_rx[3];
+
+        eeprom_read_data[1] =
+            eeprom_read_rx[4];
+
+        eeprom_read_data[2] =
+            eeprom_read_rx[5];
+
+        eeprom_read_data[3] =
+            eeprom_read_rx[6];
+
+
+        /*
+         * WRITE한 값과
+         * READ-back 값을 비교
+         */
+        if ((eeprom_read_data[0] == eeprom_write_data[3]) &&
+            (eeprom_read_data[1] == eeprom_write_data[4]) &&
+            (eeprom_read_data[2] == eeprom_write_data[5]) &&
+            (eeprom_read_data[3] == eeprom_write_data[6]))
+        {
+            /* 정상 저장 */
+            dtc_read_ready = 1;
+            eeprom_error = 0;
+        }
+        else
+        {
+            /* 저장값 불일치 */
+            dtc_read_ready = 0;
+            eeprom_error = 1;
+        }
+
+
+        /* EEPROM 처리 종료 */
+        dtc_save_request = 0;
+        eeprom_step = 0;
+    }
 }
 
 void WorkSPI(void)
 {
-	if (dtc_save_request == 0)	return;
+	if (spi_busy == 1)
+		return;
 
-	if (spi_busy == 1)	return;
 
-	spiTxData[0] = brake_dtc.dtc[0];
-	spiTxData[1] = brake_dtc.dtc[1];
-	spiTxData[2] = brake_dtc.dtc[2];
-	spiTxData[3] = brake_dtc.status.value;
+	/* Step 0 : DTC 저장 요청 → WREN */
+	if ((dtc_save_request == 1) &&
+		(eeprom_step == 0))
+	{
+		EEPROM_CS_LOW();
 
-	if (HAL_SPI_Transmit_DMA(&hspi1, spiTxData, 4) == HAL_OK) spi_busy = 1;
+		if (HAL_SPI_Transmit_DMA(
+				&hspi1,
+				&eeprom_wren_cmd,
+				1) == HAL_OK)
+		{
+			spi_busy = 1;
+			eeprom_step = 1;
+		}
+		else
+		{
+			EEPROM_CS_HIGH();
+
+			eeprom_error = 1;
+		}
+	}
+
+
+	/* Step 3 : WRITE 완료 후 Status Register 확인 */
+	else if (eeprom_step == 3)
+	{
+		eeprom_status_tx[0] = EEPROM_CMD_RDSR;
+		eeprom_status_tx[1] = 0x00;
+
+		EEPROM_CS_LOW();
+
+		if (HAL_SPI_TransmitReceive_DMA(
+				&hspi1,
+				eeprom_status_tx,
+				eeprom_status_rx,
+				2) == HAL_OK)
+		{
+			spi_busy = 1;
+			eeprom_step = 4;
+		}
+		else
+		{
+			EEPROM_CS_HIGH();
+
+			eeprom_error = 1;
+		}
+	}
+
+
+	/* Step 5 : WRITE 완료 → EEPROM READ-back */
+	else if (eeprom_step == 5)
+	{
+		/*
+		 * SPI Full Duplex이므로
+		 * READ 명령 + 주소 2Byte를 보내고
+		 * 뒤의 4Byte는 Dummy Byte를 보내면서 데이터를 수신
+		 */
+
+		eeprom_read_tx[0] = EEPROM_CMD_READ;
+
+		eeprom_read_tx[1] =
+			(uint8_t)((EEPROM_DTC_ADDR >> 8) & 0xFF);
+
+		eeprom_read_tx[2] =
+			(uint8_t)(EEPROM_DTC_ADDR & 0xFF);
+
+		eeprom_read_tx[3] = 0x00;
+		eeprom_read_tx[4] = 0x00;
+		eeprom_read_tx[5] = 0x00;
+		eeprom_read_tx[6] = 0x00;
+
+
+		EEPROM_CS_LOW();
+
+		if (HAL_SPI_TransmitReceive_DMA(
+				&hspi1,
+				eeprom_read_tx,
+				eeprom_read_rx,
+				7) == HAL_OK)
+		{
+			spi_busy = 1;
+			eeprom_step = 6;
+		}
+		else
+		{
+			EEPROM_CS_HIGH();
+
+			eeprom_error = 1;
+		}
+	}
 
 }
 
@@ -921,27 +1332,20 @@ void WorkCAN(void){
 	 /* UDS ClearDiagnosticInformation */
 	else if (RxData[0] == 0x14)
 	{
-		/* DTC Clear */
+		/* DTC RAM Clear */
 		brake_dtc.dtc[0] = 0x00;
 		brake_dtc.dtc[1] = 0x00;
 		brake_dtc.dtc[2] = 0x00;
 		brake_dtc.status.value = 0x00;
 
-		/* EEPROM Mock Clear */
-		eeprom_mock[0] = 0x00;
-		eeprom_mock[1] = 0x00;
-		eeprom_mock[2] = 0x00;
-		eeprom_mock[3] = 0x00;
+		/* EEPROM에 Clear된 DTC 다시 저장 요청 */
+		dtc_save_request = 1;
 
-		eeprom_read_data[0] = 0x00;
-		eeprom_read_data[1] = 0x00;
-		eeprom_read_data[2] = 0x00;
-		eeprom_read_data[3] = 0x00;
-
+		/* 기존 Read-back 상태 초기화 */
 		dtc_read_ready = 0;
 		eeprom_error = 0;
 
-		/* Positive Response */
+		/* UDS Positive Response */
 		TxHeader.StdId = 0x7E8;
 		TxHeader.IDE = CAN_ID_STD;
 		TxHeader.RTR = CAN_RTR_DATA;
@@ -962,45 +1366,18 @@ void WorkUART(void){
 	static uint32_t last_tick = 0;
 
 	if (HAL_GetTick() - last_tick >= 1000)
-	{
-		if (eeprom_error == 1)
-		{
-			uint8_t msg[] = "EEPROM Error\r\n";
+    {
+        uint8_t msg[] = "System Normal\r\n";
 
-			HAL_UART_Transmit(
-				&huart4,
-				msg,
-				sizeof(msg) - 1,
-				HAL_MAX_DELAY
-			);
-		}
+        HAL_UART_Transmit(
+            &huart4,
+            msg,
+            sizeof(msg) - 1,
+            HAL_MAX_DELAY
+        );
 
-		else if (brake_dtc.status.value != 0x00)
-		{
-			uint8_t msg[] = "System Fault\r\n";
-
-			HAL_UART_Transmit(
-				&huart4,
-				msg,
-				sizeof(msg) - 1,
-				HAL_MAX_DELAY
-			);
-		}
-
-		else
-		{
-			uint8_t msg[] = "System Normal\r\n";
-
-			HAL_UART_Transmit(
-				&huart4,
-				msg,
-				sizeof(msg) - 1,
-				HAL_MAX_DELAY
-			);
-		}
-
-		last_tick = HAL_GetTick();
-	}
+        last_tick = HAL_GetTick();
+    }
 
 }
 
@@ -1112,8 +1489,7 @@ void Error_Handler(void)
   }
   /* USER CODE END Error_Handler_Debug */
 }
-
-#ifdef  USE_FULL_ASSERT
+#ifdef USE_FULL_ASSERT
 /**
   * @brief  Reports the name of the source file and the source line number
   *         where the assert_param error has occurred.
@@ -1129,5 +1505,3 @@ void assert_failed(uint8_t *file, uint32_t line)
   /* USER CODE END 6 */
 }
 #endif /* USE_FULL_ASSERT */
-
-/************************ (C) COPYRIGHT STMicroelectronics *****END OF FILE****/
